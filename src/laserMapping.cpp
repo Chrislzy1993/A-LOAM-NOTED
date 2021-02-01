@@ -33,29 +33,38 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+/**
+ * @file laserMapping.cpp
+ * @brief：根据点云的边缘点和平面点特征进行scan-scan的匹配
+ * @input ：cloud, odom, cloud_corner_last, cloud_surf_last
+ * @output：map map_path
+ */
+
+#include <iostream>
+#include <string>
 #include <math.h>
 #include <vector>
-#include <aloam_velodyne/common.h>
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <geometry_msgs/PoseStamped.h>
+#include <mutex>
+#include <queue>
+#include <thread>
+
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
+
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
+#include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
+#include <geometry_msgs/PoseStamped.h>
+
 #include <eigen3/Eigen/Dense>
 #include <ceres/ceres.h>
-#include <mutex>
-#include <queue>
-#include <thread>
-#include <iostream>
-#include <string>
 
 #include "lidarFactor.hpp"
 #include "aloam_velodyne/common.h"
@@ -63,37 +72,33 @@
 
 int frameCount = 0;
 
+// 用于消息同步
 double timeLaserCloudCornerLast = 0;
 double timeLaserCloudSurfLast = 0;
 double timeLaserCloudFullRes = 0;
 double timeLaserOdometry = 0;
 
+// 
 int laserCloudCenWidth = 10;
 int laserCloudCenHeight = 10;
 int laserCloudCenDepth = 5;
+
 const int laserCloudWidth = 21;
 const int laserCloudHeight = 21;
 const int laserCloudDepth = 11;
 
-// cube的总数量，也就是上图中的小格子个总数量 21 * 21 * 11 = 4851
+// map中cube的总数量:21 * 21 * 11 = 4851
 const int laserCloudNum = laserCloudWidth * laserCloudHeight * laserCloudDepth;  // 4851
-
-// 下面两个变量是一模一样的，有点冗余，记录submap中的有效cube的index，注意submap中cube的最大数量为 5 * 5 * 5 = 125
+// 记录submap中的有效cube的index，注意submap中cube的最大数量为 5 * 5 * 5 = 125
 int laserCloudValidInd[125];
 int laserCloudSurroundInd[125];
 
-// input: from odom
 pcl::PointCloud<PointType>::Ptr laserCloudCornerLast(new pcl::PointCloud<PointType>());
 pcl::PointCloud<PointType>::Ptr laserCloudSurfLast(new pcl::PointCloud<PointType>());
 
-// ouput: all visualble cube points
 pcl::PointCloud<PointType>::Ptr laserCloudSurround(new pcl::PointCloud<PointType>());
-
-// surround points in map to build tree
 pcl::PointCloud<PointType>::Ptr laserCloudCornerFromMap(new pcl::PointCloud<PointType>());
 pcl::PointCloud<PointType>::Ptr laserCloudSurfFromMap(new pcl::PointCloud<PointType>());
-
-// input & output: points in one frame. local --> global
 pcl::PointCloud<PointType>::Ptr laserCloudFullRes(new pcl::PointCloud<PointType>());
 
 // 存放cube点云特征的数组，数组大小4851，points in every cube
@@ -104,53 +109,50 @@ pcl::PointCloud<PointType>::Ptr laserCloudSurfArray[laserCloudNum];
 pcl::KdTreeFLANN<PointType>::Ptr kdtreeCornerFromMap(new pcl::KdTreeFLANN<PointType>());
 pcl::KdTreeFLANN<PointType>::Ptr kdtreeSurfFromMap(new pcl::KdTreeFLANN<PointType>());
 
-// 点云特征匹配时的优化变量
+// mapping估计优化的位姿
 double parameters[7] = { 0, 0, 0, 1, 0, 0, 0 };
 
-// Mapping线程估计的frame在world坐标系的位姿P,因为Mapping的算法耗时很有可能会超过100ms，所以
-// 这个位姿P不是实时的，LOAM最终输出的实时位姿P_realtime,需要Mapping线程计算的相对低频位姿和
-// Odometry线程计算的相对高频位姿做整合，详见后面laserOdometryHandler函数分析。此外需要注意
-// 的是，不同于Odometry线程，这里的位姿P，即q_w_curr和t_w_curr，本身就是匹配时的优化变量。
+// mapping估计优化的位姿映射到世界坐标系下
 Eigen::Map<Eigen::Quaterniond> q_w_curr(parameters);
 Eigen::Map<Eigen::Vector3d> t_w_curr(parameters + 4);
 
-// 下面的两个变量是world坐标系下的Odometry计算的位姿和Mapping计算的位姿之间的增量（也即变换，transformation）
-// wmap_odom * wodom_curr = wmap_curr(即前面的q/t_w_curr)
-// transformation between odom's world and map's world frame
+// mapping计算的位姿与odometry计算的位姿的增量
 Eigen::Quaterniond q_wmap_wodom(1, 0, 0, 0);
 Eigen::Vector3d t_wmap_wodom(0, 0, 0);
 
-// Odometry线程计算的frame在world坐标系的位姿
+// odometry计算的位姿在世界坐标系下
 Eigen::Quaterniond q_wodom_curr(1, 0, 0, 0);
 Eigen::Vector3d t_wodom_curr(0, 0, 0);
 
+// 消息队列
 std::queue<sensor_msgs::PointCloud2ConstPtr> cornerLastBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> surfLastBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::mutex mBuf;
 
+// 降采样
 pcl::VoxelGrid<PointType> downSizeFilterCorner;
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 
+// kdtree搜索
 std::vector<int> pointSearchInd;
 std::vector<float> pointSearchSqDis;
 
-PointType pointOri, pointSel;
+PointType pointOri, pointSel; // 投影
 
 ros::Publisher pubLaserCloudSurround, pubLaserCloudMap, pubLaserCloudFullRes, pubOdomAftMapped,
     pubOdomAftMappedHighFrec, pubLaserAfterMappedPath;
-
 nav_msgs::Path laserAfterMappedPath;
 
-// set initial guess，上一帧的增量wmap_wodom * 本帧Odometry位姿wodom_curr，旨在为本帧Mapping位姿w_curr设置一个初始值
+// 将上一帧的增量wmap_wodom * 本帧Odometry位姿wodom_curr，旨在为本帧Mapping位姿w_curr设置一个初始值
 void transformAssociateToMap()
 {
   q_w_curr = q_wmap_wodom * q_wodom_curr;
   t_w_curr = q_wmap_wodom * t_wodom_curr + t_wmap_wodom;
 }
 
-// 用在最后，当Mapping的位姿w_curr计算完毕后，更新增量wmap_wodom，旨在为下一次执行transformAssociateToMap函数时做准备
+// 当Mapping的位姿w_curr计算完毕后，更新增量wmap_wodom，旨在为下一次执行transformAssociateToMap函数时做准备
 void transformUpdate()
 {
   q_wmap_wodom = q_w_curr * q_wodom_curr.inverse();
@@ -166,10 +168,9 @@ void pointAssociateToMap(PointType const* const pi, PointType* const po)
   po->y = point_w.y();
   po->z = point_w.z();
   po->intensity = pi->intensity;
-  // po->intensity = 1.0;
 }
 
-// 这个没有用到，是上面pointAssociateToMap的逆变换，即用Mapping的位姿w_curr，将world坐标系下的点变换到Lidar坐标系下
+// pointAssociateToMap的逆变换，即用Mapping的位姿w_curr，将world坐标系下的点变换到Lidar坐标系下
 void pointAssociateTobeMapped(PointType const* const pi, PointType* const po)
 {
   Eigen::Vector3d point_w(pi->x, pi->y, pi->z);
@@ -208,7 +209,7 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr& laserOdometry)
   odometryBuf.push(laserOdometry);
   mBuf.unlock();
 
-  // high frequence publish
+  // 雷达里程计pub的odom是在世界坐标系下的
   Eigen::Quaterniond q_wodom_curr;
   Eigen::Vector3d t_wodom_curr;
   q_wodom_curr.x() = laserOdometry->pose.pose.orientation.x;
@@ -218,12 +219,12 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr& laserOdometry)
   t_wodom_curr.x() = laserOdometry->pose.pose.position.x;
   t_wodom_curr.y() = laserOdometry->pose.pose.position.y;
   t_wodom_curr.z() = laserOdometry->pose.pose.position.z;
-
-  // 为了保证LOAM整体的实时性，防止Mapping线程耗时>100ms导致丢帧，用上一次的增量wmap_wodom来更新
-  // Odometry的位姿，旨在用Mapping位姿的初始值（也可以理解为预测值）来实时输出，进而实现LOAM整体的实时性
+  
+  // 根据上一帧的wmap_wodom位姿增量更新当前的odom位姿
   Eigen::Quaterniond q_w_curr = q_wmap_wodom * q_wodom_curr;
   Eigen::Vector3d t_w_curr = q_wmap_wodom * t_wodom_curr + t_wmap_wodom;
-
+  
+  // 发布更新后的odom位姿(世界坐标系下)
   nav_msgs::Odometry odomAftMapped;
   odomAftMapped.header.frame_id = "/camera_init";
   odomAftMapped.child_frame_id = "/aft_mapped";
@@ -242,8 +243,7 @@ void process()
 {
   while (1)
   {
-    // 为了保证LOAM算法整体的实时性，Mapping线程每次只处理cornerLastBuf.front()及其他与之时间同步的消息，而
-    // 因为Mapping线程耗时>100ms导致的历史缓存都会被clear
+    // 为了保证LOAM算法的实时性，每次都只处理最新的消息，同时清空以前的消息
     while (!cornerLastBuf.empty() && !surfLastBuf.empty() && !fullResBuf.empty() && !odometryBuf.empty())
     {
       mBuf.lock();
@@ -291,7 +291,8 @@ void process()
         mBuf.unlock();
         break;
       }
-
+      
+      // 同步后的点云
       laserCloudCornerLast->clear();
       pcl::fromROSMsg(*cornerLastBuf.front(), *laserCloudCornerLast);
       cornerLastBuf.pop();
@@ -319,37 +320,26 @@ void process()
         cornerLastBuf.pop();
         printf("drop lidar frame in mapping for real time performance \n");
       }
-
       mBuf.unlock();
-
       TicToc t_whole;
 
       // 上一帧的增量wmap_wodom * 本帧Odometry位姿wodom_curr，旨在为本帧Mapping位姿w_curr设置一个初始值
       transformAssociateToMap();
 
       TicToc t_shift;
-      // 下面这是计算当前帧位置t_w_curr（在上图中用红色五角星表示的位置）IJK坐标（见上图中的坐标轴），
-      // 参照LOAM_NOTED的注释，下面有关25呀，50啥的运算，等效于以50m为单位进行缩放，因为LOAM用1维数组
-      // 进行cube的管理，而数组的index只用是正数，所以要保证IJK坐标都是正数，所以加了laserCloudCenWidth/Heigh/Depth
-      // 的偏移，来使得当前位置尽量位于submap的中心处，也就是使得上图中的五角星位置尽量处于所有格子的中心附近，
-      // 偏移laserCloudCenWidth/Heigh/Depth会动态调整，来保证当前位置尽量位于submap的中心处。
-      int centerCubeI = int((t_w_curr.x() + 25.0) / 50.0) + laserCloudCenWidth;
+      // 当前帧位置t_w_curr的IJK坐标，LOAM中使用一维数组管理cube，index = i + j * width + k * width * height
+      int centerCubeI = int((t_w_curr.x() + 25.0) / 50.0) + laserCloudCenWidth; // 每个cube为50m
       int centerCubeJ = int((t_w_curr.y() + 25.0) / 50.0) + laserCloudCenHeight;
       int centerCubeK = int((t_w_curr.z() + 25.0) / 50.0) + laserCloudCenDepth;
 
-      // 由于计算机求余是向零取整，为了不使（-50.0,50.0）求余后都向零偏移，当被求余数为负数时求余结果统一向左偏移一个单位，也即减一
+      // 由于计算机求余是向下取整，为了不使（-50.0,50.0）求余后都向零偏移
       if (t_w_curr.x() + 25.0 < 0)
         centerCubeI--;
       if (t_w_curr.y() + 25.0 < 0)
         centerCubeJ--;
       if (t_w_curr.z() + 25.0 < 0)
         centerCubeK--;
-
-      // 以下注释部分参照LOAM_NOTED，结合我画的submap的示意图说明下面的6个while loop的作用：要
-      // 注意世界坐标系下的点云地图是固定的，但是IJK坐标系我们是可以移动的，所以这6个while loop
-      // 的作用就是调整IJK坐标系（也就是调整所有cube位置），使得五角星在IJK坐标系的坐标范围处于
-      // 3 < centerCubeI < 18， 3 < centerCubeJ < 8, 3 < centerCubeK < 18，目的是为了防止后续向
-      // 四周拓展cube（图中的黄色cube就是拓展的cube）时，index（即IJK坐标）成为负数。
+      
       while (centerCubeI < 3)
       {
         for (int j = 0; j < laserCloudHeight; j++)
@@ -361,11 +351,7 @@ void process()
                 laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
             pcl::PointCloud<PointType>::Ptr laserCloudCubeSurfPointer =
                 laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
-            for (; i >= 1;
-                 i--)  // 在I方向上，将cube[I] =
-                       // cube[I-1],最后一个空出来的cube清空点云，实现IJK坐标系向I轴负方向移动一个cube的
-                       // 效果，从相对运动的角度看，就是图中的五角星在IJK坐标系下向I轴正方向移动了一个cube，如下面的动图所示，所
-                       // 以centerCubeI最后++，laserCloudCenWidth也会++，为下一帧Mapping时计算五角星的IJK坐标做准备。
+            for (; i >= 1; i--)  
             {
               laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
                   laserCloudCornerArray[i - 1 + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
@@ -959,28 +945,21 @@ int main(int argc, char** argv)
   printf("line resolution %f plane resolution %f \n", lineRes, planeRes);
   downSizeFilterCorner.setLeafSize(lineRes, lineRes, lineRes);
   downSizeFilterSurf.setLeafSize(planeRes, planeRes, planeRes);
-
+  
+  // sub消息
   ros::Subscriber subLaserCloudCornerLast =
       nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 100, laserCloudCornerLastHandler);
-
   ros::Subscriber subLaserCloudSurfLast =
       nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_surf_last", 100, laserCloudSurfLastHandler);
-
   ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/laser_odom_to_init", 100, laserOdometryHandler);
-
-  ros::Subscriber subLaserCloudFullRes =
-      nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_3", 100, laserCloudFullResHandler);
-
+  ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_3", 100, laserCloudFullResHandler);
+  
+  // pub消息
   pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_surround", 100);
-
   pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_map", 100);
-
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/velodyne_cloud_registered", 100);
-
   pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 100);
-
   pubOdomAftMappedHighFrec = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init_high_frec", 100);
-
   pubLaserAfterMappedPath = nh.advertise<nav_msgs::Path>("/aft_mapped_path", 100);
 
   for (int i = 0; i < laserCloudNum; i++)
@@ -992,6 +971,5 @@ int main(int argc, char** argv)
   std::thread mapping_process{ process };
 
   ros::spin();
-
   return 0;
 }

@@ -33,6 +33,13 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+/**
+ * @file scanRegistration.cpp
+ * @brief：对点云进行预处理，计算点云水平角和垂直角信息，提取点云中的边缘点和平面点特征
+ * @input：cloud
+ * @output：cloud, cloud_sharp, cloud_less_sharp, cloud_flat, cloud_less_flat等
+ */
+
 #include <cmath>
 #include <vector>
 #include <string>
@@ -44,7 +51,7 @@
 #include <tf/transform_broadcaster.h>
 #include <nav_msgs/Odometry.h>
 
-#include <opencv/cv.h>
+// #include <opencv/cv.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -127,7 +134,6 @@ void removeClosedPointCloud(const pcl::PointCloud<PointT>& cloud_in, pcl::PointC
  * @brief 4. 对每个SCAN计算每个点(去除最左最右边上的5个点)的曲率
  * @brief 5. 对曲率进行排序，提取点云中的边缘点和平面点
  * @brief 6. 发布ros消息
- * @param laserCloudMsg
  */
 void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
 {
@@ -170,7 +176,7 @@ void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     endOri += 2 * M_PI;
   }
   
-  // 3. 计算点云中每个点的垂直角，根据水平角划入Scan
+  // 3. 计算点云中每个点的垂直角，并划入不同的Scan中
   bool halfPassed = false;  // lidar扫描线是否旋转过半
   int count = cloudSize;  // 统计除去雷达垂直角范围外的点后的点数
   PointType point;
@@ -225,7 +231,7 @@ void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
 
     // 计算旋转角
     float ori = -atan2(point.y, point.x);
-    // 根据旋转角是否过半选择与起始角做差值还是终止角做差值
+    // 根据旋转角是否过半选择与起始角做差值还是终止角做差值????
     if (!halfPassed) 
     {
       //确保-pi/2 < ori - startOri < 3*pi/2
@@ -437,7 +443,7 @@ void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
   printf("sort q time %f \n", t_q_sort);
   printf("seperate points time %f \n", t_pts.toc());
   
-  // 6. 发布ros消息
+  // 6. 发布ros消息，包括：全点云(laserCloud)和特征点云(cornerSharp, cornerLessSharp, surfFlat, surfLessFlat)
   sensor_msgs::PointCloud2 laserCloudOutMsg;
   pcl::toROSMsg(*laserCloud, laserCloudOutMsg);
   laserCloudOutMsg.header.stamp = laserCloudMsg->header.stamp;
@@ -468,7 +474,7 @@ void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
   surfPointsLessFlat2.header.frame_id = "/camera_init";
   pubSurfPointsLessFlat.publish(surfPointsLessFlat2);
 
-  // pub each scan
+  // 是否发布每一线的点云
   if (PUB_EACH_LINE)
   {
     for (int i = 0; i < N_SCANS; i++)

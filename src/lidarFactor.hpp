@@ -54,11 +54,11 @@ struct LidarEdgeFactor
                                      const Eigen::Vector3d last_point_b_, const double s_)
   {
     return (new ceres::AutoDiffCostFunction<LidarEdgeFactor, 3, 4, 3>(
-        //					             ^  ^  ^
-        //					             |  |  |
-        //			      残差的维度 ____|  |  |
-        //			 优化变量q的维度 _______|  |
-        //			 优化变量t的维度 __________|
+                                    //					             ^  ^  ^
+                                    //					             |  |  |
+                                    //			    残差的维度 ____|  |  |
+                                    //		  优化变量q的维度 _______|  |
+                                    //			优化变量t的维度 __________|
         new LidarEdgeFactor(curr_point_, last_point_a_, last_point_b_, s_)));
   }
 
